@@ -35,6 +35,158 @@ export default class StringDecoder extends Transformer<StringDecoderOptions> {
     super('StringDecoder', options)
   }
 
+  private evalMathExpression(node: Expression): number | undefined {
+    if (Guard.isLiteralNumeric(node)) return node.value
+    if (Guard.isLiteralString(node)) {
+      const parsed = Number(node.value)
+      return Number.isFinite(parsed) ? parsed : undefined
+    }
+    if (Guard.isUnaryExpression(node) || Guard.isLiteral(node)) {
+      const parsed = literalOrUnaryExpressionToNumber(node as any, true)
+      return Number.isFinite(parsed) ? parsed : undefined
+    }
+    if (!Guard.isBinaryExpression(node)) return undefined
+
+    const left = this.evalMathExpression(node.left as Expression)
+    const right = this.evalMathExpression(node.right as Expression)
+    if (left === undefined || right === undefined) return undefined
+
+    switch (node.operator) {
+      case '+':
+        return left + right
+      case '-':
+        return left - right
+      case '*':
+        return left * right
+      case '/':
+        return right === 0 ? undefined : left / right
+      case '%':
+        return right === 0 ? undefined : left % right
+      case '<<':
+        return left << right
+      case '>>':
+        return left >> right
+      case '>>>':
+        return left >>> right
+      case '^':
+        return left ^ right
+      case '|':
+        return left | right
+      case '&':
+        return left & right
+      default:
+        return undefined
+    }
+  }
+
+  private tryFindModernDecoder(
+    context: Context,
+    node: any
+  ): DecoderFunction | undefined {
+    if (!node.id) return
+    const fnId = node.id.name
+    const body = filterEmptyStatements(node.body.body)
+    if (body.length === 0) return
+
+    let ourStringArray = ''
+    const stringArrayNames = context.stringArrays.map((i) => i.identifier)
+    for (const stmt of body) {
+      if (!Guard.isVariableDeclaration(stmt)) continue
+      for (const decl of stmt.declarations) {
+        if (!decl.init || !Guard.isCallExpression(decl.init)) continue
+        if (!Guard.isIdentifier(decl.init.callee)) continue
+        if (!stringArrayNames.includes(decl.init.callee.name)) continue
+        ourStringArray = decl.init.callee.name
+        break
+      }
+      if (ourStringArray) break
+    }
+    if (!ourStringArray) return
+
+    const params = node.params
+      .filter((p: any) => Guard.isIdentifier(p))
+      .map((p: Identifier) => p.name)
+    if (params.length === 0) return
+    const firstParam = params[0]
+
+    let calcOffset = 0
+    let foundOffset = false
+    for (const stmt of body) {
+      if (!Guard.isExpressionStatement(stmt)) continue
+      if (!Guard.isAssignmentExpression(stmt.expression)) continue
+      const ae = stmt.expression
+      if (!Guard.isIdentifier(ae.left) || ae.left.name !== firstParam) continue
+      if (!Guard.isBinaryExpression(ae.right)) continue
+      if (!Guard.isIdentifier(ae.right.left)) continue
+      if (ae.right.left.name !== firstParam) continue
+      const num = this.evalMathExpression(ae.right.right as Expression)
+      if (num === undefined) continue
+      calcOffset = ae.right.operator === '-' ? -num : num
+      foundOffset = true
+      break
+    }
+    if (!foundOffset) return
+
+    const localFnArity = new Map<string, number>()
+    let qclHcwTarget: string | undefined
+    let charset: string | undefined
+    walk(node.body, {
+      FunctionDeclaration(fd) {
+        if (!fd.id) return
+        localFnArity.set(fd.id.name, fd.params.length)
+      },
+      VariableDeclarator(vd) {
+        if (!Guard.isIdentifier(vd.id)) return
+        if (!vd.init || !Guard.isFunctionExpression(vd.init)) return
+        localFnArity.set(vd.id.name, vd.init.params.length)
+      },
+      AssignmentExpression(ae) {
+        if (!Guard.isMemberExpression(ae.left)) return
+        if (!Guard.isIdentifier(ae.left.object)) return
+        if (ae.left.object.name !== fnId) return
+        const prop = ae.left.property
+        const isQcl =
+          (Guard.isIdentifier(prop) && prop.name === 'QclHcw') ||
+          (Guard.isLiteralString(prop as any) &&
+            (prop as StringLiteral).value === 'QclHcw')
+        if (!isQcl) return
+        if (!Guard.isIdentifier(ae.right)) return
+        qclHcwTarget = ae.right.name
+      },
+      Literal(lit) {
+        if (!Guard.isLiteralString(lit)) return
+        if (lit.value.length !== 65) return
+        if (!lit.value.includes('+/=')) return
+        charset = lit.value
+      },
+    })
+
+    let decType = DecoderFunctionType.SIMPLE
+    if (qclHcwTarget && localFnArity.get(qclHcwTarget) === 2) {
+      decType = DecoderFunctionType.RC4
+    } else if (qclHcwTarget && localFnArity.get(qclHcwTarget) === 1) {
+      decType = DecoderFunctionType.BASE64
+    }
+
+    const defaultCharset =
+      'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/='
+    const decFn = {
+      identifier: fnId,
+      stringArrayIdentifier: ourStringArray,
+      offset: calcOffset,
+      type: decType,
+      indexArgument: 0,
+      keyArgument: 1,
+    } as DecoderFunction
+
+    if (decType === DecoderFunctionType.BASE64) {
+      ;(decFn as DecoderFunctionBase64).charset = charset || defaultCharset
+    } else if (decType === DecoderFunctionType.RC4) {
+      ;(decFn as DecoderFunctionRC4).charset = charset || defaultCharset
+    }
+    return decFn
+  }
+
   private literals_to_arg_array(
     array: Node[]
   ): (string | number | undefined)[] {
@@ -326,9 +478,32 @@ export default class StringDecoder extends Transformer<StringDecoderOptions> {
   }
 
   funcFinder(context: Context) {
+    const self = this
     walk(context.ast, {
       FunctionDeclaration(node) {
         if (!node.id) return
+        if (context.stringDecoders.find((d) => d.identifier === node.id!.name))
+          return
+
+        const modernDecoder = self.tryFindModernDecoder(context, node)
+        if (modernDecoder) {
+          context.stringDecoders.push(modernDecoder)
+          if (context.removeGarbage) {
+            ;(node as any).type = 'EmptyStatement'
+          }
+          context.log(
+            'Found decoder function',
+            node.id?.name,
+            'arrayId =',
+            modernDecoder.stringArrayIdentifier,
+            'offset =',
+            modernDecoder.offset,
+            'type =',
+            modernDecoder.type
+          )
+          return
+        }
+
         const block = node.body
         const fnId = node.id.name
 
@@ -592,7 +767,7 @@ export default class StringDecoder extends Transformer<StringDecoderOptions> {
     const stringArray = context.stringArrays.find(
       (i) => i.identifier === stringArrayIdent
     )!
-    let maxLoops = stringArray.strings.length * 2,
+    let maxLoops = stringArray.strings.length * 8,
       iteration = 0
     while (true) {
       iteration++
