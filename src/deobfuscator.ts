@@ -125,6 +125,23 @@ export class Deobfuscator {
     }
   }
 
+  private stripEmptyStatements(ast: Program): Program {
+    walk(ast, {
+      Program(node) {
+        node.body = node.body.filter((stmt) => stmt.type !== 'EmptyStatement')
+      },
+      BlockStatement(node) {
+        node.body = node.body.filter((stmt) => stmt.type !== 'EmptyStatement')
+      },
+      SwitchCase(node) {
+        node.consequent = node.consequent.filter(
+          (stmt) => stmt.type !== 'EmptyStatement'
+        )
+      },
+    })
+    return ast
+  }
+
   public async deobfuscateNode(
     node: Program,
     _options?: Partial<DeobfuscateOptions>
@@ -189,7 +206,7 @@ export class Deobfuscator {
       }
     }
 
-    return context.ast
+    return this.stripEmptyStatements(context.ast)
   }
 
   public async deobfuscateSource(

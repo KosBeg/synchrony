@@ -1,6 +1,6 @@
 const esbuild = require('esbuild'),
   { join } = require('path'),
-  { copyFileSync } = require('fs')
+  { copyFileSync, chmodSync } = require('fs')
 
 const process_exit = process.exit
 
@@ -44,7 +44,13 @@ function emitTypes() {
 function noop() {}
 function postBuild() {
   console.log('Copying CLI ===')
-  copyFileSync(join(SRC_PATH, 'cli.js'), join(DIST_PATH, 'cli.js'))
+  const cliPath = join(DIST_PATH, 'cli.js')
+  copyFileSync(join(SRC_PATH, 'cli.js'), cliPath)
+  try {
+    chmodSync(cliPath, 0o755)
+  } catch (err) {
+    console.warn('Failed to set executable bit for CLI:', err)
+  }
 
   console.log('Building type declarations ===')
   emitTypes()

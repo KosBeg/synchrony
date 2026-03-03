@@ -128,8 +128,15 @@ export default class StringDecoder extends Transformer<StringDecoderOptions> {
     if (!foundOffset) return
 
     const localFnArity = new Map<string, number>()
-    let qclHcwTarget: string | undefined
+    const fnPropertyAssignments = new Map<string, string>()
+    const fnPropertyCalls = new Set<string>()
     let charset: string | undefined
+    const getMemberPropertyName = (prop: Node): string | undefined => {
+      if (Guard.isIdentifier(prop)) return prop.name
+      if (Guard.isLiteralString(prop as any))
+        return (prop as StringLiteral).value
+      return undefined
+    }
     walk(node.body, {
       FunctionDeclaration(fd) {
         if (!fd.id) return
@@ -144,14 +151,18 @@ export default class StringDecoder extends Transformer<StringDecoderOptions> {
         if (!Guard.isMemberExpression(ae.left)) return
         if (!Guard.isIdentifier(ae.left.object)) return
         if (ae.left.object.name !== fnId) return
-        const prop = ae.left.property
-        const isQcl =
-          (Guard.isIdentifier(prop) && prop.name === 'QclHcw') ||
-          (Guard.isLiteralString(prop as any) &&
-            (prop as StringLiteral).value === 'QclHcw')
-        if (!isQcl) return
+        const propName = getMemberPropertyName(ae.left.property)
+        if (!propName) return
         if (!Guard.isIdentifier(ae.right)) return
-        qclHcwTarget = ae.right.name
+        fnPropertyAssignments.set(propName, ae.right.name)
+      },
+      CallExpression(ce) {
+        if (!Guard.isMemberExpression(ce.callee)) return
+        if (!Guard.isIdentifier(ce.callee.object)) return
+        if (ce.callee.object.name !== fnId) return
+        const propName = getMemberPropertyName(ce.callee.property)
+        if (!propName) return
+        fnPropertyCalls.add(propName)
       },
       Literal(lit) {
         if (!Guard.isLiteralString(lit)) return
@@ -162,10 +173,20 @@ export default class StringDecoder extends Transformer<StringDecoderOptions> {
     })
 
     let decType = DecoderFunctionType.SIMPLE
-    if (qclHcwTarget && localFnArity.get(qclHcwTarget) === 2) {
-      decType = DecoderFunctionType.RC4
-    } else if (qclHcwTarget && localFnArity.get(qclHcwTarget) === 1) {
-      decType = DecoderFunctionType.BASE64
+    let decoderTarget: string | undefined
+    for (const propName of fnPropertyCalls) {
+      const target = fnPropertyAssignments.get(propName)
+      if (!target) continue
+      const arity = localFnArity.get(target)
+      if (arity === 2) {
+        decoderTarget = target
+        decType = DecoderFunctionType.RC4
+        break
+      }
+      if (arity === 1 && !decoderTarget) {
+        decoderTarget = target
+        decType = DecoderFunctionType.BASE64
+      }
     }
 
     const defaultCharset =
@@ -758,7 +779,7 @@ export default class StringDecoder extends Transformer<StringDecoderOptions> {
     breakCond: number,
     stringArrayIdent: string,
     parseIntChain: BinaryExpression
-  ) => {
+  ): boolean => {
     const { util_decode, literals_to_arg_array } = this
     const st = new Simplify({})
     // String eval loop
@@ -767,14 +788,13 @@ export default class StringDecoder extends Transformer<StringDecoderOptions> {
     const stringArray = context.stringArrays.find(
       (i) => i.identifier === stringArrayIdent
     )!
-    let maxLoops = stringArray.strings.length * 8,
+    // Some samples require one final wrap-around iteration to reach breakCond.
+    let maxLoops = stringArray.strings.length * 8 + 1,
       iteration = 0
     while (true) {
       iteration++
       if (iteration > maxLoops) {
-        throw new Error(
-          `Push/shift calculation failed (iter=${iteration}>maxLoops=${maxLoops})`
-        )
+        return false
       }
       // Classes suck
       const bpic = immutate(parseIntChain)
@@ -844,6 +864,7 @@ export default class StringDecoder extends Transformer<StringDecoderOptions> {
       }
     }
     context.shiftedArrays++
+    return true
   }
 
   // Locate push/shift pair inside IIFE
@@ -918,7 +939,13 @@ export default class StringDecoder extends Transformer<StringDecoderOptions> {
           `Failed to find string array with identifier "${stringArrayIdent}" for push/shift calc`
         )
 
-      calcShift(context, breakCond as number, stringArray.identifier, pic)
+      const shiftFound = calcShift(
+        context,
+        breakCond as number,
+        stringArray.identifier,
+        pic
+      )
+      if (!shiftFound) return false
       context.log('Found push/shift IIFE breakCond =', breakCond)
       if (context.removeGarbage) {
         return true
@@ -1030,7 +1057,7 @@ export default class StringDecoder extends Transformer<StringDecoderOptions> {
           foundBinExp = true
         },
       })
-      if (!foundBinExp || !breakCond || !pic) return false
+      if (!foundBinExp || breakCond === undefined || !pic) return false
 
       context.log(
         'Found push/shift (#2) IIFE stringArray =',
@@ -1038,7 +1065,13 @@ export default class StringDecoder extends Transformer<StringDecoderOptions> {
         'breakCond =',
         breakCond
       )
-      calcShift(context, breakCond, stringArrayFunc.identifier, pic)
+      const shiftFound = calcShift(
+        context,
+        breakCond,
+        stringArrayFunc.identifier,
+        pic
+      )
+      if (!shiftFound) return false
 
       return true
     }
